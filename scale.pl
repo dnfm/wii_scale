@@ -12,7 +12,6 @@ use IO::Poll qw( POLLIN );
 use POSIX qw( ceil floor );
 use Term::ANSIScreen qw( :color :cursor :screen :constants );
 
-
 # Set to 0 to leave it in kg.
 Readonly my $convert_to_pounds => 1;
 
@@ -198,7 +197,7 @@ sub show_scale {
                  . "+";
 
     # top, mid, and bottom are subtracted.
-    my $lines_around_mid = $scale_height - 3 / 2;
+    my $lines_around_mid = ( $scale_height - 3 ) / 2;
 
     print BOLD BLUE . '+' . '-' x $space . "+\n";
     print $p . centre( "Wii Balance Board (Battery $battery%)", $space ) . "$p\n";
