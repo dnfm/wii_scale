@@ -37,7 +37,6 @@ Here's an example of the program's output:
 
 The following perl modules are required to make this work:
 
-- Readonly
 - Try::Tiny
 - Term::ANSIScreen
 
@@ -50,12 +49,14 @@ Also required (but you should already have them because they're in core) are:
 - POSIX
 - IO::Poll
 - List::Util
+- Pod::Usage
+- Getopt::Long
 
 Only non-perl prerequisite is xWiimote which can be obtained [here](https://github.com/dvdhrm/xwiimote).
 
 ## Before Running
 
-There are a few variables at the top of the script you can edit to change the behaviour of the program a bit.
+There are a few variables at the top of the script you can edit to change the behaviour of the program a bit.  You can also specify them on the command-line instead.  Run with --help to see how to do that.
 
 `fudge_factor` just modifies the weight up or down in case your Balance Board isn't exactly right.  I used some weights from a local sporting good store to find mine reads too low by a bit.  You can use positive or negative numbers.
 
@@ -64,6 +65,10 @@ There are a few variables at the top of the script you can edit to change the be
 `scale_width` the width in characters of your terminal the little graphic showing your scale will be.
 
 `scale_height` the height in characters of your terminal the little graphic showing your scale will be.
+
+`exit_on_width` will make the program quit and print the final weight once it's decided the weight has stopped adjusting and moving around too much.
+
+`disconnect_on_exit` (linux only) -- the way it does it is rudimentary, but will shell out to bluetoothctl and issue a disconnect command when exiting to save battery (the wii balance board will just stay on forever if you let it until the batteries die.)
 
 ## Usage
 
@@ -75,4 +80,4 @@ The program will instruct you what to do from there.
 
 ## License
 
-Released under the GNU GPL 3.0.  Do with it what you please.  I provide no warranty of any kind.
+Released under the same terms as perl itself.

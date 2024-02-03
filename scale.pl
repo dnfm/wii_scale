@@ -5,28 +5,52 @@ use warnings;
 
 use xwiimote;
 
-use Readonly;
 use Try::Tiny;
 use List::Util qw( sum );
 use IO::Poll qw( POLLIN );
 use POSIX qw( ceil floor );
+use Pod::Usage;
+use Getopt::Long;
 use Term::ANSIScreen qw( :color :cursor :screen :constants );
 
 # Set to 0 to leave it in kg.
-Readonly my $convert_to_pounds => 1;
+my $convert_to_pounds  = 0;
 
 # If your balance board reads off by X, set that here.  It can be negative,
 # and is in the same units as you use in this app, so if you have
 # convert_to_pounds set to 1, then this is the fudge factor in pounds.
 # Otherwise, it's in kg.
-Readonly my $fudge_factor      => 0;
+my $fudge_factor       = 0;
 
 # The width of the scale graphic in beautiful ASCII text.
-Readonly my $scale_width       => 80;
+my $scale_width        = 80;
 
 # The height of the scale graphic in beautiful ASCII text.
-Readonly my $scale_height      => 20;
+my $scale_height       = 20;
  
+# Exit on weight means once the scale has concluded the weight has stopped
+# shifting around/changing enough to get an accurate reading, it'll quit.
+# Otherwise, ctrl-c to quit.
+my $exit_on_weight     = 0;
+
+# Disconnect the wii scale once a weight is calculated.
+my $disconnect_on_exit = 0;
+
+# Whether to display help and quit.
+my $help               = 0;
+
+GetOptions(
+    'fudge_factor=f'     => \$fudge_factor,
+    'use_pounds'         => \$convert_to_pounds,
+    'scale_width=i'      => \$scale_width,
+    'scale_height=i'     => \$scale_height,
+    'exit_on_weight'     => \$exit_on_weight,
+    'disconnect_on_exit' => \$disconnect_on_exit,
+    'help'               => \$help,
+) or pod2usage( 1 );
+
+pod2usage( 0 ) if $help;
+
 $Term::ANSIScreen::AUTORESET = 1;
 
 my %types = (
@@ -38,87 +62,147 @@ my %types = (
     unknown       => 'Unknown Wii Device',
 );
 
-$SIG{ INT }  = \&restore_cursor;
-$SIG{ TERM } = \&restore_cursor;
+$SIG{ INT }  = \&restore_cursor_and_exit;
+$SIG{ TERM } = \&restore_cursor_and_exit;
 
 go();
 
-sub restore_cursor {
-    locate( 1, 1 );
+my $device_mac;
+
+sub restore_cursor_and_exit {
+    print cls();
+
+    loadpos();
 
     print "\e[?25h";
 
-    warn "$_[0]\n" if $_[0];
+    print "$_[0]\n" if $_[0] && $_[0] !~ m/^INT|TERM$/;
+
+    system( 'bluetoothctl', 'disconnect', $device_mac ) if $device_mac;
 
     exit;
 }
 
 sub go {
+    savepos();
+
     print cls();
 
     my $using;
+    my $iface;
 
-    try {
-        my $iterations = 0;
-        my %seen;
+    OPEN_DEVICE: {
+        try {
+            my $iterations = 0;
+            my %seen;
 
-        print "Turn your balance board on now.\n";
+            print "Turn your balance board on now.\n";
 
-        while ( $iterations++ < 60 ) {
-            my $monitor = xwiimote::monitor->new( 1, 1 );
+            while ( $iterations++ < 60 ) {
+                sleep 1;
 
-            while ( defined( my $entry = $monitor->poll ) ) {
-                my $identity = identify( $entry );
+                my $monitor = xwiimote::monitor->new( 1, 1 );
 
-                # if it's still working on identifying it, ignore it for now.
-                next if $identity eq 'pending';
+                while ( defined( my $entry = $monitor->poll ) ) {
+                    my $identity = identify( $entry );
 
-                next if $seen{ $entry }++;
+                    # if it's still working on identifying it, ignore it for now.
+                    next if $identity eq 'pending';
 
-                my $name = $types{ $identity } // $types{ unknown };
-                my $n    = substr( $name, 0, 1 ) =~ m{[aeiou]} ? 'n' : '';
+                    next if $seen{ $entry }++;
 
-                print "Found a$n $name.";
+                    my $name = $types{ $identity } // $types{ unknown };
+                    my $n    = substr( $name, 0, 1 ) =~ m{[aeiou]} ? 'n' : '';
 
-                if ( $identity eq 'balanceboard' ) {
-                    print "  Using it!";
+                    print "Found a$n $name.";
 
-                    $using = $entry;
+                    if ( $identity eq 'balanceboard' ) {
+                        print "  Using it!";
+
+                        $using = $entry;
+                    }
+                    elsif ( $identity eq 'unknown' ) {
+                        redo OPEN_DEVICE;
+                    }
+
+                    print "\n";
                 }
 
-                print "\n";
+                last if defined $using;
+
+                sleep 1;
+            }
+        }
+        catch {
+            die "couldn't create a monitor: $_\n";
+        };
+
+        if ( !defined $using ) {
+            die "Timed out trying to find a balance board.\n";
+        }
+
+        local $SIG{ ALRM } = sub { die "ALARM\n" };
+        alarm( 5 );
+
+        try {
+            $iface = get_iface( $using );
+
+            $iface->open( $iface->available() | $xwiimote::IFACE_WRITABLE );
+        }
+        catch {
+            alarm( 0 );
+
+            if ( $_ eq 'ALARM' ) {
+                warn "Timed out trying to open the device.  Trying again.\n";
+
+                undef $iface;
+
+                redo OPEN_DEVICE;
             }
 
-            last if defined $using;
+            die "Couldn't open balance board device: $_\n";
+        };
 
-            sleep 1;
-        }
+        alarm( 0 );
     }
-    catch {
-        die "couldn't create a monitor: $_\n";
-    };
-
-    if ( !defined $using ) {
-        die "Timed out trying to find a balance board.\n";
-    }
-
-    my $iface = get_iface( $using );
-
-    try {
-        $iface->open( $iface->available() | $xwiimote::IFACE_WRITABLE );
-    }
-    catch {
-        die "Couldn't open balance board device: $_\n";
-    };
     
-    # Seed the battery information.
+    die "Failed or timed out opening a device.\n" if !$iface;
+
+    print "Opened.\n";
+
+    # Find the device's mac address so we can tell bluetoothctl to disconnect it.
+    $device_mac = get_device_mac( $iface ) if $disconnect_on_exit;
+
+    # Seed the battery information (and this will start the poller.)
     update_battery( $iface );
+}
 
-    # Remember where the cursor was when we started.
-    savepos();
+sub get_device_mac {
+    my ( $iface ) = @_;
 
-    # Start the poller.
-    poller( $iface );
+    my $path = $iface->get_syspath();
+
+    my $return_sub = sub {
+        warn "$_[0]; can't automatically disconnect.\n";
+
+        return;
+    };
+
+    return $return_sub->( "Couldn't get device path" ) if !$path;
+
+    my $uevent_file = "$path/uevent";
+
+    return $return_sub->( "$uevent_file isn't readable" ) if !-r $uevent_file;
+
+    open my $fh, '<', $uevent_file;
+
+    return $return_sub->( "Couldn't open $uevent_file: $!" ) if !$fh;
+
+    chomp( my ( $mac ) = map { /^HID_UNIQ=(\S+)/ } grep { /^HID_UNIQ/ } <$fh> );
+
+    return $return_sub->( "Didn't find MAC in $uevent_file." ) if !$mac;
+
+    return $mac;
 }
 
 sub get_iface {
@@ -153,6 +237,8 @@ sub poller {
     local $SIG{ ALRM } = sub { update_battery( $iface ) };
     alarm( 10 );
 
+    show_scale();
+
     while ( $poller->poll() != -1 ) {
         try {
             $iface->dispatch( $event );
@@ -178,13 +264,13 @@ sub show_scale {
     my $battery = get_battery();
     my %weights = get_weights();
 
-    loadpos();
+    locate( 1, 1 );
 
     print "\e[?25l";
 
     my $p = BOLD BLUE . '|' . RESET;
 
-    my $weight = $weights{ average }
+    my $weight = ( $weights{ average } // 0 )
                . ( $convert_to_pounds ? ' lbs' : ' kg' );
 
     # the pipes or pluses on each side removes 2 chars.
@@ -252,6 +338,8 @@ sub centre {
     my $total;
     my $avg;
 
+    my %got_weight;
+
     # the average updates way less often.
     my $average_calls = 0;
 
@@ -260,6 +348,11 @@ sub centre {
 
         my $height = scalar( @{ $matrix      } );
         my $width  = scalar( @{ $matrix->[0] } );
+
+        $tl //= 0;
+        $tr //= 0;
+        $bl //= 0;
+        $br //= 0;
 
         my $left  = $tl + $bl;
         my $right = $tr + $br;
@@ -297,7 +390,41 @@ sub centre {
         $bl = $conv->(3);
         $br = $conv->(1);
 
-        $total = $tl + $tr + $bl + $br;
+        $total = sprintf( '%.2f', $tl + $tr + $bl + $br );
+
+        my $time = time;
+
+        $got_weight{ $time } = $total if $total + ( $fudge_factor // 0 ) > 0;
+
+        my $close_enough = 1;
+
+        my @range = ( $time - 5 ) .. $time;
+
+        foreach my $sample ( @range ) {
+            if ( !defined $got_weight{ $sample } || $got_weight{ $sample } < 10 ) {
+                $close_enough = 0;
+
+                last;
+            }
+
+            if (   $total - .25 > $got_weight{ $sample }
+                || $total + .25 < $got_weight{ $sample } ) {
+
+                $close_enough = 0;
+
+                last;
+            }
+        }
+
+        my $f_avg = sprintf( '%.2f', ( sum( map { $got_weight{ $_ } // 0 } @range ) / 6 ) );
+
+        if ( $close_enough && $exit_on_weight ) {
+            alarm( 0 );
+
+            sleep 1;
+
+            restore_cursor_and_exit( "$f_avg" . ( $convert_to_pounds ? 'lbs' : 'kg' ) );
+        }
 
         # if the total weight is less than the fudge factor, don't use it --
         # basically, if it's near 0, it's probably actually zero.
@@ -347,12 +474,8 @@ sub centre {
     sub update_battery {
         my ( $iface ) = @_;
 
-        try {
-            $battery = $iface->get_battery();
-        }
-        catch {
-            die "Couldn't get battery status: $_\n";
-        };
+        $battery = try { $iface->get_battery() }
+                 catch { $battery };
 
         alarm( 10 );
 
@@ -360,7 +483,62 @@ sub centre {
         poller( $iface );
     }
 
-    sub get_battery {
-        return $battery;
-    }
+    sub get_battery { $battery }
 }
+
+__END__
+
+=head1 NAME
+
+scale.pl - Use the wii scale on your system with xwiimote like a standard
+bathroom scale.
+
+=head1 SYNOPSIS
+
+Options can be set in the variables at the top of the file manually, or
+specified on the command line here.  The command line will override values in
+the file.
+
+scale.pl [options]
+
+Options:
+
+    --help
+        You're reading it.
+
+    --fudge_factor=<amount> [default: 0]
+        Some scales consistently read too high or too low.  This will adjust
+        the reading by <amount>.  Negative and decimal values are OK.  In the
+        same units as the program is being used.
+
+    --use_pounds
+        Whether to display the weight in lbs.  Default is kg.
+
+    --scale_width=<amount> [default: 80]
+        Width of the scale ansi graphic in columns.
+
+    --scale_height=<amount> [default: 20]
+        Height of the scale ansi graphic in rows.
+
+    --exit_on_weight
+        By default, this program will just keep reading from the scale.  To
+        quit, you'd hit CTRL-C.  If this is enabled, then once the program
+        detects the weight has settled and it has an accurate read, it will
+        quit and display the final reading.
+
+    --disconnect_on_exit
+        By default, the program will just exit.  If you specify this option, it
+        will shell out to bluetoothctl and issue a disconnect to the scale.
+        Keep in mind the wii scale has no power management, and if you don't
+        disconnect your system from it, it will happily just sit there
+        connected until the battery dies.  Good job, Nintendo.  This only works
+        on Linux and the way it does it is a little gross, but it works for me.
+        Patches welcome and all that.
+
+=head1 AUTHOR
+
+    Justin Wheeler <github dot com at datademons dot com>
+
+=head1 LICENSE
+
+    This program is distributed under the same license as Perl itself.
